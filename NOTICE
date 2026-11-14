@@ -30,3 +30,13 @@ them, charge nothing for them, and will remove them at Meta's request
 (wupsbr@gmail.com).
 
 ElevenLabs is a third-party service with its own terms; you supply your own key.
+
+North Pole Santa Communicator (this copy):
+Builds on the fork above for the AIPI Lite. Changes: CONFIG_MUSE_FULLSCREEN_ART
+(esp32/components/muse/Kconfig, esp32/components/muse/muse_ui.c), the AIPI
+overlay settings in esp32/devices/sdkconfig.muse-aipi, and the full-screen
+Christmas screen in esp32/components/muse/avatar/ and design/ (original
+artwork, Apache License 2.0). The screen's lettering is drawn with Mountains of
+Christmas by Tart Workshop (SIL Open Font License 1.1); the font file itself
+is not included. Unofficial: not affiliated with or endorsed by Meta, Muse,
+Waveshare, ElevenLabs or the AIPI Lite's maker.

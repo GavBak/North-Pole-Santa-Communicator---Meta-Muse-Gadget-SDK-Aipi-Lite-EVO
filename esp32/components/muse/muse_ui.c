@@ -1,6 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
+ * Modified for the North Pole Santa Communicator: CONFIG_MUSE_FULLSCREEN_ART.
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -478,6 +480,9 @@ static void build_button_icons(lv_obj_t *face)
     s_mic_icon = make_mic(face, s_tall ? 24 : s_small ? 12 : 26);
     lv_obj_align(s_mic_icon, t->align, t->x, t->y);
     set_mic_color(COLOR_DIM);
+#if CONFIG_MUSE_FULLSCREEN_ART
+    lv_obj_set_style_opa(s_mic_icon, LV_OPA_TRANSP, 0);   /* still shown and hidden as usual, never seen */
+#endif
 
     /* Without touch the aux button opens the menu rather than sleeping. A board
      * that leaves aux_hint out has no button to put an icon beside. */
@@ -487,6 +492,9 @@ static void build_button_icons(lv_obj_t *face)
     s_aux_icon = make_label(face, s_small ? &lv_font_montserrat_14 : &lv_font_montserrat_28, COLOR_DIM);
     lv_label_set_text(s_aux_icon, muse_board->touch ? LV_SYMBOL_POWER : LV_SYMBOL_LIST);
     lv_obj_align(s_aux_icon, a->align, a->x, a->y);
+#if CONFIG_MUSE_FULLSCREEN_ART
+    lv_obj_set_style_opa(s_aux_icon, LV_OPA_TRANSP, 0);   /* the picture labels the buttons itself */
+#endif
 }
 
 static void on_canvas_clicked(lv_event_t *e)
@@ -932,6 +940,9 @@ static void build_screen(void)
     s_wifi_icon = make_label(status, &lv_font_montserrat_14, COLOR_DIM);
     s_ble_icon = make_label(status, &lv_font_montserrat_14, COLOR_DIM);
     s_power_lbl = make_label(status, &lv_font_unscii_8, COLOR_DIM);
+#if CONFIG_MUSE_FULLSCREEN_ART
+    lv_obj_set_style_opa(status, LV_OPA_TRANSP, 0);
+#endif
 
     /* The compact layout leaves the state to the avatar and the caption,
      * unless the screen is tall enough to fit it in small type above Muse. */
@@ -951,6 +962,9 @@ static void build_screen(void)
     lv_obj_set_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN, s_small && !s_tall && s_h < 200);
 
     s_caption_lbl = make_label(face, font_pick(caption_font(), &lv_font_unscii_8), COLOR_CAPTION);
+#if CONFIG_MUSE_FULLSCREEN_ART
+    lv_obj_add_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN);   /* its empty dark band would show on the picture */
+#endif
     if (s_small) {
         /* Two lines over the bottom of the face, on a dark band so they stay
          * legible. A tall screen has room to keep them above the mic icon. */
@@ -1763,6 +1777,16 @@ static void update_status(muse_mode_t mode, float now)
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
         }
     }
+#if CONFIG_MUSE_FULLSCREEN_ART
+    /* Only status and error captions (NO WI-FI, CAN'T REACH MUSE...) go over
+     * the picture: a turn's own text (listening, what was heard, the reply
+     * being spoken) stays off it. Speech is untouched. */
+    bool turn = mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_THINKING || mode == MUSE_MODE_SPEAKING;
+    bool show = caption[0] && !turn;
+    if (show == lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_set_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN, !show);
+    }
+#endif
     update_power(now);
 }
 
@@ -1885,6 +1909,9 @@ esp_err_t muse_ui_start(void)
     if (muse_board->avatar_px > 0) {
         s_canvas_px = muse_board->avatar_px;
     }
+#if CONFIG_MUSE_FULLSCREEN_ART
+    s_canvas_px = s_w < s_h ? s_w : s_h;   /* the picture is the screen */
+#endif
     if (s_canvas_px > s_w) {
         s_canvas_px = s_w / MUSE_PX_W * MUSE_PX_W;
     }

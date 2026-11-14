@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Modified for the North Pole Santa Communicator: adds MUSE_FULLSCREEN_ART.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -161,6 +162,18 @@ menu "Muse"
             one 16 px line at a time. Takes about 850 KB of flash and no RAM.
             Without it those characters show as boxes. Hangul isn't
             included.
+
+    config MUSE_FULLSCREEN_ART
+        bool "Avatar is a full-screen picture"
+        depends on MUSE_ENABLED
+        default n
+        help
+            For a custom components/muse/avatar/muse_pixel.c that draws a
+            whole-screen picture rather than a character: the avatar canvas
+            becomes the full screen at one screen pixel per pixel, and the
+            button hint icons and the status line (Wi-Fi, Bluetooth, battery)
+            are not drawn over it on the main screen. Captions, the bottom
+            state bar, menus, settings and pop-ups still show.
 
     config MUSE_JC3248W535_MIC_GPIO
         int "JC3248W535: GPIO for an external I2S mic's data (SD) line"
