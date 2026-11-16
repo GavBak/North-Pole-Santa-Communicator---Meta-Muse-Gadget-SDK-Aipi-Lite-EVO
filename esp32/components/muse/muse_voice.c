@@ -37,6 +37,16 @@
 #include "muse_settings.h"
 #include "muse_state.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_WAKE_WORD
+#include "muse_menu.h"
+#include "muse_wake.h"
+#endif
+#if CONFIG_MUSE_WAKE_WORD || CONFIG_MUSE_NPSC_WAKE_RECORD
+#include "muse_npsc.h"
+#endif
+#if CONFIG_MUSE_NPSC_JINGLE
+#include "avatar/npsc_jingle.h"
+#endif
 
 static const char *TAG = "muse_voice";
 
@@ -51,6 +61,27 @@ static const char *TAG = "muse_voice";
 #endif
 #define SETTLE_CHUNKS 10   /* after Muse makes a sound, 200 ms of capture is its own tail */
 #define REST_BACKSTOP_MS 60000
+#if CONFIG_MUSE_WAKE_WORD
+/* A turn "hey Santa" started has no release: it ends on silence once speech
+ * has started, judged against the mic's noise floor (tracked while idle and
+ * during the turn). */
+#define HF_SPEECH_DB 10.0f        /* above the floor: speech */
+#define HF_SPEECH_CHUNKS 3        /* 60 ms of speech in a row counts as speaking */
+#define HF_QUIET_CHUNKS 50        /* 1.0 s without speech, once it started, ends the turn */
+#define HF_GRACE_CHUNKS 10        /* the first 200 ms is the tail of "hey Santa" itself */
+#define HF_START_FRAMES (MUSE_AUDIO_RATE * 5)   /* nothing said in 5 s: dropped */
+#define HF_FOLLOW_FRAMES (MUSE_AUDIO_RATE * 3)  /* follow-up turns: 3 s of quiet ends the session */
+#define HF_DISCARD_CHUNKS 15                    /* 300 ms of speaker tail, not pre-roll, not in the 3 s */
+/*
+ * The floor is a low quantile of the 20 ms levels: it steps down 0.5 dB on a
+ * quieter chunk and up 0.03 dB (1.5 dB/s) otherwise, so it sits near the
+ * quietest ~6% of the room noise. One odd chunk (a DMA glitch, a zeroed
+ * buffer) moves it 0.5 dB, not all the way, and digital silence is ignored.
+ */
+#define HF_FLOOR_FALL_DB 0.5f
+#define HF_FLOOR_RISE_DB 0.03f
+#define HF_FLOOR_MIN_DB (-90.0f)  /* quieter than this is a zeroed buffer, not the room */
+#endif
 #define SNORE_STALE_MS 500    /* a snore asked for longer ago than this is dropped */
 #define SNORE_AMP 1100.0f     /* peak; the chirp's is ~7000: about 16 dB quieter */
 
@@ -98,6 +129,42 @@ static muse_adpcm_t s_pre_enc;
 #endif
 static int16_t s_chunk[MUSE_AUDIO_CHUNK];
 static int s_settle;
+#if CONFIG_MUSE_WAKE_WORD
+static bool s_wake_ok;         /* the model loaded */
+static bool s_wake_heard;      /* idle_capture heard "hey Santa" */
+static bool s_wake_fresh;      /* not listening last chunk: start the model over */
+static float s_floor_db = -60.0f;
+static bool s_convo;          /* a "hey santa" session: listen again after each reply */
+static bool s_convo_listen;   /* the next loop pass is a follow-up record() */
+
+static void track_floor(float *floor, float db)
+{
+    if (db < HF_FLOOR_MIN_DB) {
+        return;
+    }
+    *floor += db < *floor ? -HF_FLOOR_FALL_DB : HF_FLOOR_RISE_DB;
+}
+
+/* Listen only when a press would start a plain turn: awake, idle, not in
+ * the menu or a story. */
+static bool wake_listening(void)
+{
+    if (!s_wake_ok || muse_state_asleep() || muse_state_mode(NULL) != MUSE_MODE_IDLE || muse_menu_is_open()) {
+        return false;
+    }
+#if CONFIG_MUSE_NPSC_STORY
+    if (muse_npsc_story_active()) {
+        return false;
+    }
+#endif
+#if CONFIG_MUSE_NPSC_WAKE_RECORD
+    if (muse_npsc_wake_record_active() || muse_npsc_wake_record_wanted()) {
+        return false;
+    }
+#endif
+    return true;
+}
+#endif
 
 /*
  * The note being recorded (HOLD_NOTES), kept whole in case it can't go now.
@@ -140,6 +207,10 @@ static void pre_reset(void)
 {
     s_pre_fill = 0;
     s_settle = SETTLE_CHUNKS;
+#if CONFIG_MUSE_WAKE_WORD
+    s_wake_heard = false;
+    s_wake_fresh = true;   /* Muse's own sound mustn't count toward the wake word */
+#endif
 }
 
 /* One 20 ms idle read: feeds the pre-roll ring and the settings mic meter. */
@@ -157,6 +228,19 @@ static void idle_capture(void)
         s_settle--;
         return;
     }
+#if CONFIG_MUSE_WAKE_WORD
+    if (wake_listening()) {
+        if (s_wake_fresh) {
+            s_wake_fresh = false;
+            muse_wake_reset();
+        }
+        track_floor(&s_floor_db, muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK));
+        s_wake_heard |= muse_wake_feed(s_chunk, MUSE_AUDIO_CHUNK);
+    } else {
+        s_wake_fresh = true;
+        s_wake_heard = false;
+    }
+#endif
     pre_chunk_t *c = &s_pre[s_pre_next];
 #if MUSE_LOW_MEM
     c->start = s_pre_enc;
@@ -178,6 +262,27 @@ static bool got_event(muse_ptt_t type)
         hit |= ev.type == type;
     }
     return hit;
+}
+
+/* Drain queued talk events. *down / *up (if given) are set if that edge arrived. */
+static void drain_talk(bool *down, bool *up)
+{
+    muse_input_event_t ev;
+    if (down) {
+        *down = false;
+    }
+    if (up) {
+        *up = false;
+    }
+    while (xQueueReceive(s_queue, &ev, 0) == pdTRUE) {
+        muse_state_poke();
+        if (down && ev.type == MUSE_PTT_DOWN) {
+            *down = true;
+        }
+        if (up && ev.type == MUSE_PTT_UP) {
+            *up = true;
+        }
+    }
 }
 
 /* Level stats of a recording, gathered chunk by chunk for the log. */
@@ -249,16 +354,51 @@ static void take(rec_stats_t *st, const int16_t *pcm)
  * kept note to fall back on (why says what failed). There is no start chirp:
  * anything played now would land on top of the first words.
  */
-static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+static volatile uint32_t s_rec_starts, s_rec_ends;   /* record() calls begun and finished */
+static volatile int64_t s_stop_us;     /* muse_voice_stop_reply(), 0 for none */
+static volatile bool s_jingle;
+#define STOP_KEEP_US 70000000LL
+
+bool muse_voice_recording(void)
 {
+    return s_rec_starts != s_rec_ends;
+}
+
+uint32_t muse_voice_recordings_started(void)
+{
+    return s_rec_starts;
+}
+
+static bool record(bool barge_in, bool hands_free, bool *spoke, size_t *held, char *why, size_t cap,
+                   size_t start_frames, bool follow_up, bool *cancelled, bool local, size_t cap_frames,
+                   size_t *clip_from)
+{
+    *spoke = !hands_free;
+    if (cancelled) {
+        *cancelled = false;
+    }
+    if (clip_from) {
+        *clip_from = 0;
+    }
+#if !CONFIG_MUSE_WAKE_WORD
+    (void)start_frames;
+    (void)follow_up;
+#endif
+    if (!local) {
+        (void)cap_frames;
+    }
+    s_stop_us = 0;
+    s_rec_starts++;
     muse_state_set_mode(MUSE_MODE_LISTENING);
     muse_state_set_progress(0);
     s_rec_n = s_sent = 0;
     s_live = s_tried = false;
-    if (!s_rec || (muse_hatch_ready() && !s_held_count)) {
+    if (!local && (!s_rec || (muse_hatch_ready() && !s_held_count))) {
         go_live();
     }
-    muse_state_set_caption(s_live ? "LISTENING..." : "RECORDING...");
+    if (!local) {
+        muse_state_set_caption(s_live ? "LISTENING..." : "RECORDING...");
+    }
     bool heard = false, ok = true;
     bool gave_up = false;   /* Hatch failed this note: it's kept, and goes later */
     char text[96];
@@ -270,7 +410,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
         for (int i = 0; i < SETTLE_CHUNKS; i++) {
             muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK);
         }
-    } else {
+    } else if (!follow_up) {
         for (size_t i = 0; i < s_pre_fill; i++) {
             pre_get(i, s_chunk);
             take(&st, s_chunk);
@@ -280,6 +420,15 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
     size_t pre = n;
     bool released = false;
     size_t stop_at = MAX_FRAMES;
+#if CONFIG_MUSE_WAKE_WORD
+    float floor_db = s_floor_db;
+    int loud = 0, quiet = 0;
+    bool cancel = false;
+    const char *cancel_why = NULL;
+    if (!start_frames) {
+        start_frames = HF_START_FRAMES;
+    }
+#endif
     while (n + MUSE_AUDIO_CHUNK <= stop_at) {
         if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
             break;
@@ -289,7 +438,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
         /* Live transcript as the caption. A failure stops the streaming; the
          * kept note goes later, or without one the failure is the caption. */
         muse_hatch_ev_t ev;
-        while (s_live && (ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
+        while (!local && s_live && (ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
             if (ev == MUSE_HATCH_EV_HEARD && text[0]) {
                 heard = true;
                 muse_state_set_caption("%s", text);
@@ -307,25 +456,114 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
         }
         n += MUSE_AUDIO_CHUNK;
         bool tick = n % (MUSE_AUDIO_CHUNK * 5) == 0;
-        if (tick && s_rec && !s_live && !gave_up && !s_held_count && muse_hatch_ready()) {
+        if (!local && tick && s_rec && !s_live && !gave_up && !s_held_count && muse_hatch_ready()) {
             ESP_LOGI(TAG, "Muse in reach: streaming the note so far");
             go_live();
         }
         muse_state_set_progress((float)n / MAX_FRAMES);
-        if (!heard && ok && tick) {
+        if (!local && !heard && ok && tick) {
             muse_state_set_caption("%s %.1fs", s_live ? "LISTENING" : "RECORDING", (double)n / MUSE_AUDIO_RATE);
         }
         /*
          * Capture runs 60-80 ms behind real time and people let go on their
          * last syllable, so keep going briefly after release.
          */
-        if (!released && got_event(MUSE_PTT_UP)) {
-            released = true;
-            stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
+        if (!released) {
+            bool down = false, up = false;
+            drain_talk(&down, &up);
+#if CONFIG_MUSE_WAKE_WORD
+            /* A talk press in the quiet window, before speech, ends the
+             * session and must not send a near-empty clip. After speech
+             * has started, a click still ends and sends, as before. */
+            if (hands_free && (down || up) && (local || !*spoke)) {
+                cancel = true;
+                cancel_why = "talk press";
+                released = true;
+                stop_at = n;
+            } else
+#endif
+            if (up) {
+                released = true;
+                *spoke = true;   /* the talk button ended it: send what there is */
+                stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
+            }
         }
+#if CONFIG_MUSE_WAKE_WORD
+        if (hands_free && !released) {
+            if (muse_menu_is_open()) {
+                cancel = true;
+                cancel_why = "menu";
+                released = true;
+                stop_at = n;
+            } else {
+                int64_t stop = s_stop_us;
+                if (stop && esp_timer_get_time() - stop < STOP_KEEP_US) {
+                    s_stop_us = 0;
+                    cancel = true;
+                    cancel_why = "stop";
+                    released = true;
+                    stop_at = n;
+                }
+            }
+        }
+        if (hands_free && !released) {
+            float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
+            /* Follow-up turns have already discarded the speaker tail; the
+             * first 200 ms is only the tail of "hey Santa" itself. */
+            bool grace = !follow_up && n - pre <= HF_GRACE_CHUNKS * MUSE_AUDIO_CHUNK;
+            /*
+             * Only a run of speech resets the quiet count: anything else,
+             * room noise a little over the floor or a lone click, counts as
+             * quiet, so the turn ends 1 s after the last word.
+             */
+            loud = !grace && db > floor_db + HF_SPEECH_DB ? loud + 1 : 0;
+            if (loud >= HF_SPEECH_CHUNKS) {
+                if (!*spoke) {
+                    /* Keep 200 ms before the first speech so the clip isn't clipped. */
+                    size_t pre_roll = MUSE_AUDIO_RATE / 5;
+                    size_t from = n > pre + pre_roll ? n - pre_roll : pre;
+                    if (clip_from) {
+                        *clip_from = from;
+                    }
+                    if (local && cap_frames) {
+                        size_t cap_at = from + cap_frames;
+                        if (cap_at < stop_at) {
+                            stop_at = cap_at;
+                        }
+                    }
+                }
+                *spoke = true;
+                quiet = 0;
+            } else {
+                quiet++;
+            }
+            track_floor(&floor_db, db);
+            if (!local) {
+                *spoke |= heard;   /* Muse transcribed something */
+            }
+            if ((*spoke && quiet >= HF_QUIET_CHUNKS) || (!*spoke && n - pre >= start_frames)) {
+                ESP_LOGI(TAG, "\"hey santa\" turn: %s after %.2fs, floor %.1f dBFS",
+                         *spoke ? "1 s quiet" : "nothing said", (double)(n - pre) / MUSE_AUDIO_RATE,
+                         (double)floor_db);
+                released = true;
+                stop_at = n;
+            }
+        }
+#endif
     }
     muse_state_set_level(0);
     *held = n - pre;
+#if CONFIG_MUSE_WAKE_WORD
+    if (cancel) {
+        *spoke = false;
+        if (cancelled) {
+            *cancelled = true;
+        }
+        if (why && cancel_why) {
+            strlcpy(why, cancel_why, cap);
+        }
+    }
+#endif
 
     char tail[160];
     int tl = 0;
@@ -338,6 +576,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
     ESP_LOGI(TAG, "recorded %.2fs%s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped, gain %d dB",
              (double)n / MUSE_AUDIO_RATE, released ? "" : " (max)", rms_db < -100.0f ? -100.0f : rms_db,
              20.0 * log10((st.peak + 1) / 32768.0), st.floor_db, st.clipped, muse_settings_mic_gain());
+    s_rec_ends++;
     return ok;
 }
 
@@ -395,6 +634,24 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
                 break;
             }
         }
+        int64_t stop = s_stop_us;
+        if (stop && esp_timer_get_time() - stop < STOP_KEEP_US) {
+            s_stop_us = 0;
+            ESP_LOGI(TAG, "reply stopped");
+            muse_hatch_turn_cancel();
+            muse_state_set_level(0);
+            go_idle("");
+            return false;
+        }
+#if CONFIG_MUSE_WAKE_WORD
+        if (muse_menu_is_open()) {
+            ESP_LOGI(TAG, "reply stopped: menu open");
+            muse_hatch_turn_cancel();
+            muse_state_set_level(0);
+            go_idle("");
+            return false;
+        }
+#endif
         if (got_event(MUSE_PTT_DOWN)) {
             ESP_LOGI(TAG, "reply interrupted");
             muse_hatch_turn_cancel();
@@ -858,12 +1115,255 @@ static void play_snore(void)
     }
 }
 
+#if CONFIG_MUSE_NPSC_JINGLE
+static void play_jingle(void)
+{
+    for (size_t i = 0; i < NPSC_JINGLE_FRAMES; i += MUSE_AUDIO_CHUNK) {
+        if (uxQueueMessagesWaiting(s_queue)) {
+            break;   /* a press goes first */
+        }
+        size_t n = NPSC_JINGLE_FRAMES - i < MUSE_AUDIO_CHUNK ? NPSC_JINGLE_FRAMES - i : MUSE_AUDIO_CHUNK;
+        muse_audio_write(NPSC_JINGLE + i, n);
+    }
+}
+#endif
+
+#if CONFIG_MUSE_WAKE_WORD
+/* Drop the speaker's tail so it isn't pre-roll and isn't the 3 s window.
+ * Returns false if the session should end (menu, talk press, or stop). */
+static bool convo_prepare_listen(const char **why)
+{
+    pre_reset();
+    for (int i = 0; i < HF_DISCARD_CHUNKS; i++) {
+        if (muse_menu_is_open()) {
+            *why = "menu";
+            return false;
+        }
+        int64_t stop = s_stop_us;
+        if (stop && esp_timer_get_time() - stop < STOP_KEEP_US) {
+            s_stop_us = 0;
+            *why = "stop";
+            return false;
+        }
+        bool down = false, up = false;
+        drain_talk(&down, &up);
+        if (down || up) {
+            *why = "talk press";
+            return false;
+        }
+        if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        /* The discarded samples are not written to the pre-roll ring. */
+    }
+    s_pre_fill = 0;
+    return true;
+}
+
+static void convo_end(const char *why)
+{
+    ESP_LOGI(TAG, "continuous conversation: ended (%s)", why);
+    s_convo = false;
+    s_convo_listen = false;
+}
+#endif
+
+
+#if CONFIG_MUSE_NPSC_WAKE_RECORD
+#define WR_DISCARD_CHUNKS 15            /* 300 ms after the cue beep, same as convo */
+#define WR_RESULT_MS 800
+#define WR_DONE_HOLD_MS 1200
+#define WR_SAY_WAIT_US 20000000LL
+#define WR_CAP_FRAMES (MUSE_AUDIO_RATE * NPSC_WAKE_RECORD_CAP_S)
+#define WR_START_FRAMES (MUSE_AUDIO_RATE * NPSC_WAKE_RECORD_START_S)
+
+static bool wr_cancelled(void)
+{
+    if (muse_npsc_wake_record_cancelled()) {
+        return true;
+    }
+    if (muse_menu_is_open()) {
+        muse_npsc_wake_record_cancel();
+        return true;
+    }
+    return false;
+}
+
+static bool wr_say(const char *words)
+{
+    char *p = malloc(strlen(words) + 1);
+    if (!p) {
+        return false;
+    }
+    memcpy(p, words, strlen(words) + 1);
+    muse_voice_clear_stop();
+    if (!muse_hatch_say(p)) {
+        return false;
+    }
+    int64_t t0 = esp_timer_get_time();
+    while (!muse_hatch_push_take()) {
+        if (wr_cancelled()) {
+            muse_voice_stop_reply();
+            return false;
+        }
+        if (esp_timer_get_time() - t0 > WR_SAY_WAIT_US) {
+            ESP_LOGW(TAG, "wake record: say timed out");
+            muse_voice_stop_reply();
+            return false;
+        }
+        bool down = false, up = false;
+        drain_talk(&down, &up);
+        if (down || up) {
+            muse_npsc_wake_record_cancel();
+            muse_voice_stop_reply();
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    bool barge = play_push();
+    pre_reset();
+    if (barge) {
+        muse_npsc_wake_record_cancel();
+        return false;
+    }
+    return !wr_cancelled();
+}
+
+static void wr_discard(void)
+{
+    pre_reset();
+    for (int i = 0; i < WR_DISCARD_CHUNKS; i++) {
+        bool down = false, up = false;
+        drain_talk(&down, &up);
+        if (down || up || muse_menu_is_open()) {
+            muse_npsc_wake_record_cancel();
+            return;
+        }
+        if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    s_pre_fill = 0;
+}
+
+static const char *const WR_COUNT_WORD[] = { "no", "one", "two", "three", "four", "five" };
+
+static void run_wake_record(void)
+{
+    muse_npsc_wake_record_begin();
+    muse_npsc_wake_record_set(0, NPSC_WR_INTRO, 0);
+    ESP_LOGI(TAG, "wake record: starting a session of %d", NPSC_WAKE_RECORD_ROUNDS);
+    if (!wr_say("Let's do a test of five. I'll cue you each time.")) {
+        if (wr_cancelled()) {
+            goto done;
+        }
+        ESP_LOGW(TAG, "wake record: intro speech failed, continuing with beeps");
+    }
+    if (wr_cancelled()) {
+        goto done;
+    }
+
+    for (int r = 1; r <= NPSC_WAKE_RECORD_ROUNDS; r++) {
+        if (wr_cancelled()) {
+            break;
+        }
+        muse_npsc_wake_record_set(r, NPSC_WR_CUE, muse_npsc_wake_record_session_saved());
+        if (r > 1 && !wr_say("Again!") && wr_cancelled()) {
+            break;
+        }
+        if (wr_cancelled()) {
+            break;
+        }
+        muse_npsc_wake_record_set(r, NPSC_WR_LISTEN, muse_npsc_wake_record_session_saved());
+        if (muse_settings_speaker_on()) {
+            muse_audio_chirp(1);
+        }
+        wr_discard();
+        if (wr_cancelled()) {
+            break;
+        }
+
+        size_t held = 0, clip_from = 0;
+        char why[96] = { 0 };
+        bool spoke = false, cancelled = false;
+        (void)record(false, true, &spoke, &held, why, sizeof(why), WR_START_FRAMES, true, &cancelled,
+                     true, WR_CAP_FRAMES, &clip_from);
+        muse_state_set_mode(MUSE_MODE_IDLE);
+        pre_reset();
+        if (cancelled || wr_cancelled()) {
+            break;
+        }
+        if (spoke && s_rec && s_rec_n > clip_from) {
+            size_t n = s_rec_n - clip_from;
+            bool saved = muse_npsc_wake_record_save(s_rec + clip_from, n);
+            ESP_LOGI(TAG, "wake record: round %d/%d %s (%.2fs, from %.2fs)", r, NPSC_WAKE_RECORD_ROUNDS,
+                     saved ? "saved" : "skipped (no room)", (double)n / MUSE_AUDIO_RATE,
+                     (double)clip_from / MUSE_AUDIO_RATE);
+            muse_npsc_wake_record_set(r, saved ? NPSC_WR_SAVED : NPSC_WR_SKIPPED,
+                                      muse_npsc_wake_record_session_saved());
+        } else {
+            ESP_LOGI(TAG, "wake record: round %d/%d skipped (%s after %.2fs)", r,
+                     NPSC_WAKE_RECORD_ROUNDS, why[0] ? why : "nothing said",
+                     (double)held / MUSE_AUDIO_RATE);
+            muse_npsc_wake_record_set(r, NPSC_WR_SKIPPED, muse_npsc_wake_record_session_saved());
+        }
+        int64_t until = esp_timer_get_time() + (int64_t)WR_RESULT_MS * 1000;
+        while (esp_timer_get_time() < until && !wr_cancelled()) {
+            bool down = false, up = false;
+            drain_talk(&down, &up);
+            if (down || up) {
+                muse_npsc_wake_record_cancel();
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    if (!wr_cancelled()) {
+        int n = muse_npsc_wake_record_session_saved();
+        muse_npsc_wake_record_set(0, NPSC_WR_DONE, n);
+        char line[80];
+        if (n >= 0 && n <= 5) {
+            snprintf(line, sizeof(line), "You recorded %s clip%s.", WR_COUNT_WORD[n], n == 1 ? "" : "s");
+        } else {
+            snprintf(line, sizeof(line), "You recorded %d clips.", n);
+        }
+        (void)wr_say(line);
+        int64_t until = esp_timer_get_time() + (int64_t)WR_DONE_HOLD_MS * 1000;
+        while (esp_timer_get_time() < until && !wr_cancelled()) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+done:
+    ESP_LOGI(TAG, "wake record: session ended, %d of %d saved this time, %d clips in memory",
+             muse_npsc_wake_record_session_saved(), NPSC_WAKE_RECORD_ROUNDS, muse_npsc_wake_record_stored());
+    muse_npsc_wake_record_finish();
+    go_idle("");
+}
+#endif
+
 static void voice_task(void *arg)
 {
     bool pending_down = false;
     muse_audio_selftest();
+#if CONFIG_MUSE_WAKE_WORD
+    s_wake_ok = muse_wake_init() == ESP_OK;
+    s_wake_fresh = true;
+#endif
     for (;;) {
         bool wake = false;
+        bool hands_free = false;   /* "hey Santa" started this turn */
+        bool follow_up = false;    /* auto-listen after a hands-free reply */
+#if CONFIG_MUSE_WAKE_WORD
+        if (s_convo_listen) {
+            /* Stay out of idle: wake word stays paused until go_idle. */
+            s_convo_listen = false;
+            hands_free = true;
+            follow_up = true;
+            pending_down = false;
+        } else
+#endif
         if (!pending_down) {
             muse_input_event_t ev;
             bool asleep = muse_state_asleep();
@@ -908,6 +1408,15 @@ static void voice_task(void *arg)
                     pre_reset();
                 }
             }
+            if (s_jingle) {
+                s_jingle = false;
+#if CONFIG_MUSE_NPSC_JINGLE
+                if (muse_settings_speaker_on()) {
+                    play_jingle();
+                    pre_reset();
+                }
+#endif
+            }
             if (s_mp3test) {
                 s_mp3test = false;
                 int16_t *pcm = NULL;
@@ -923,9 +1432,21 @@ static void voice_task(void *arg)
                 muse_audio_loopback_test(muse_settings_volume());
                 pre_reset();
             }
+#if CONFIG_MUSE_NPSC_WAKE_RECORD
+            if (muse_npsc_wake_record_wanted()) {
+                set_resting(false);
+                muse_wifi_power(MUSE_WIFI_FULL);
+                run_wake_record();
+                continue;
+            }
+#endif
             /* The 20 ms read paces this loop. */
             idle_capture();
-            if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
+#if CONFIG_MUSE_WAKE_WORD
+            hands_free = s_wake_heard && !uxQueueMessagesWaiting(s_queue);   /* a press goes first */
+            s_wake_heard = false;
+#endif
+            if (!hands_free && xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
                 if (muse_hatch_push_take()) {
                     pending_down = play_push();
                     pre_reset();
@@ -938,10 +1459,13 @@ static void voice_task(void *arg)
             }
             muse_hatch_push_drop();   /* a press goes first; its turn replaces the push's */
             muse_state_poke();
-            if (ev.type != MUSE_PTT_DOWN) {
+            if (hands_free) {
+                ESP_LOGI(TAG, "\"hey santa\": starting a turn");
+            } else if (ev.type != MUSE_PTT_DOWN) {
                 continue;
+            } else {
+                wake = ev.wake;
             }
-            wake = ev.wake;
         }
         if (wake && !held_on_waking()) {
             continue;   /* a tap: it only woke Muse */
@@ -949,30 +1473,97 @@ static void voice_task(void *arg)
         muse_wifi_power(MUSE_WIFI_FULL);
         if (!can_record()) {
             pending_down = false;
+#if CONFIG_MUSE_WAKE_WORD
+            if (s_convo) {
+                convo_end("can't record");
+            }
+#endif
             continue;
         }
         size_t held;
-        char why[96];
-        bool ok = record(pending_down, &held, why, sizeof(why));
+        char why[96] = { 0 };
+        bool spoke;
+        bool cancelled = false;
+        size_t start_frames = 0;
+#if CONFIG_MUSE_WAKE_WORD
+        start_frames = follow_up ? HF_FOLLOW_FRAMES : HF_START_FRAMES;
+#endif
+        bool ok = record(pending_down, hands_free, &spoke, &held, why, sizeof(why),
+                         start_frames, follow_up, &cancelled, false, 0, NULL);
         pending_down = false;
+        if (!spoke) {   /* "hey Santa" and then nothing said, or a cancel */
+            muse_hatch_turn_cancel();
+            drop_rec();
+            pre_reset();
+#if CONFIG_MUSE_WAKE_WORD
+            if (s_convo) {
+                muse_state_make_happy();
+                convo_end(cancelled && why[0] ? why : "nothing said");
+            }
+#endif
+            go_idle("");
+            continue;
+        }
         if (held < MIN_HELD_FRAMES && !wake) {
             muse_hatch_turn_cancel();
             drop_rec();
             pre_reset();
+#if CONFIG_MUSE_WAKE_WORD
+            if (s_convo) {
+                convo_end("too short");
+            }
+#endif
             go_idle("HOLD LONGER TO TALK");
             continue;
         }
         if (!ok) {
             pre_reset();
+#if CONFIG_MUSE_WAKE_WORD
+            if (s_convo) {
+                convo_end("error");
+            }
+#endif
             go_idle(why);   /* Hatch failed it while recording */
             continue;
         }
+#if CONFIG_MUSE_WAKE_WORD
+        if (hands_free) {
+            s_convo = true;
+        }
+#endif
         pending_down = finish_note();
         pre_reset();
+#if CONFIG_MUSE_WAKE_WORD
+        if (pending_down) {
+            /* A talk barge-in during the reply leaves continuous mode. */
+            if (s_convo) {
+                convo_end("talk barge-in");
+            }
+        } else if (s_convo && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+            const char *end_why = "stop";
+            if (convo_prepare_listen(&end_why)) {
+                ESP_LOGI(TAG, "continuous conversation: listening for 3 s");
+                s_convo_listen = true;
+            } else {
+                muse_state_make_happy();
+                go_idle("");
+                convo_end(end_why);
+            }
+        } else {
+            if (s_convo) {
+                convo_end(muse_state_mode(NULL) == MUSE_MODE_IDLE ? "reply stopped" : "done");
+            }
+            if (muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+                muse_state_make_happy();
+                go_idle("");
+            }
+        }
+#else
         if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
             muse_state_make_happy();
             go_idle("");
         }
+#endif
     }
 }
 
@@ -1007,6 +1598,23 @@ float muse_voice_monitor_db(void)
 void muse_voice_request_chirp(void)
 {
     s_chirp = true;
+    muse_state_nudge();
+}
+
+void muse_voice_stop_reply(void)
+{
+    int64_t now = esp_timer_get_time();
+    s_stop_us = now ? now : 1;
+}
+
+void muse_voice_clear_stop(void)
+{
+    s_stop_us = 0;
+}
+
+void muse_voice_request_jingle(void)
+{
+    s_jingle = true;
     muse_state_nudge();
 }
 

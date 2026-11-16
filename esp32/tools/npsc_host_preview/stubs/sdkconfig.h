@@ -1,0 +1,3 @@
+#pragma once
+#define CONFIG_MUSE_NPSC 1
+#define CONFIG_MUSE_NPSC_COUNTDOWN 1

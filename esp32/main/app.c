@@ -166,6 +166,26 @@ static void ui_set_status(const char *s) {
     s_ui_status[sizeof(s_ui_status) - 1] = '\0';
 }
 
+// CONFIG_MUSE_DEFAULT_WIFI_SSID: saved, as phone setup would, when NVS has
+// no network at all, so a fresh device joins without setup. Saved networks
+// always win; the password is never logged.
+static void seed_default_wifi(void) {
+#ifdef CONFIG_MUSE_DEFAULT_WIFI_SSID
+    if (!CONFIG_MUSE_DEFAULT_WIFI_SSID[0]) return;
+    char ssid[33] = {0};
+    if (config_get_str("ssid", ssid, sizeof(ssid)) && ssid[0]) return;
+    wifi_known_list_t *list = malloc(sizeof(*list));
+    if (!list) return;
+    int n = wifi_known_load(list);
+    wifi_known_wipe(list);
+    free(list);
+    if (n > 0) return;
+    bool ok = wifi_known_remember(CONFIG_MUSE_DEFAULT_WIFI_SSID, CONFIG_MUSE_DEFAULT_WIFI_PASSWORD, 0);
+    ESP_LOGI(TAG, "no saved wifi; %s the default network %s", ok ? "saved" : "couldn't save",
+             CONFIG_MUSE_DEFAULT_WIFI_SSID);
+#endif
+}
+
 static void ui_set_wifi(const char *ssid) {
     if (ssid && *ssid) {
         snprintf(s_ui_wifi, sizeof(s_ui_wifi), "%s", ssid);
@@ -2480,6 +2500,7 @@ void app_run(void) {
 
     config_store_init();
     wifi_known_init();
+    seed_default_wifi();
 
     identity_init();
 #if CONFIG_MUSE_ENABLED

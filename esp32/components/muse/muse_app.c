@@ -31,6 +31,7 @@
 #include "muse_ui.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#include "muse_npsc.h"
 
 static const char *TAG = "muse";
 
@@ -77,7 +78,11 @@ void muse_app_run(const muse_board_t *board)
     ESP_ERROR_CHECK(muse_input_start(q));
 
     /* Let the boot animation (flame ignites, eyes open) play out. */
+#ifdef CONFIG_MUSE_NPSC_BOOT_SHOW_MS
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_MUSE_NPSC_BOOT_SHOW_MS));   /* the NPSC power-on screen */
+#else
     vTaskDelay(pdMS_TO_TICKS(1400));
+#endif
     if (!board->audio_init) {
         ESP_LOGI(TAG, "display-only board: no microphone or speaker");
         muse_state_set_mode(MUSE_MODE_IDLE);
@@ -90,6 +95,9 @@ void muse_app_run(const muse_board_t *board)
     }
 
     muse_hatch_start();
+#if CONFIG_MUSE_NPSC
+    muse_npsc_start();
+#endif
     /* Home Link owns the radios; these just hand it the saved settings. */
     muse_wifi_apply();
     muse_ble_apply();

@@ -140,6 +140,25 @@ void muse_hatch_text_turn(char *text);
 void muse_hatch_text_cancel(void);
 
 /*
+ * A turn started by the gadget itself (CONFIG_MUSE_NPSC_SPOKEN: story time,
+ * goodnight): `text` goes to the chat as a typed message would, and the reply
+ * plays like a push, spoken and captioned as usual (the voice task takes it
+ * with muse_hatch_push_take). Only between turns. Takes `text` (malloc'd,
+ * under 1 KiB) and frees it. False if it couldn't be queued.
+ */
+bool muse_hatch_spoken_turn(char *text);
+
+/*
+ * Speaks `text` word for word with the ElevenLabs voice, no Muse involved
+ * (CONFIG_MUSE_NPSC_STORY: story time; CONFIG_MUSE_NPSC_WAKE_RECORD: the recording session). It plays like a push: the voice task
+ * takes it with muse_hatch_push_take, muse_voice_stop_reply() or a press
+ * stops it, and a TALK press ends it for a turn of its own. Needs Wi-Fi; with
+ * no speech it ends with the error "STORIES NEED WI-FI". Only between turns.
+ * Takes `text` (malloc'd, under 1 KiB) and frees it. False if not queued.
+ */
+bool muse_hatch_say(char *text);
+
+/*
  * Prints one "@chat" line per call (more if `text` is long): the type, then the
  * printf-style `fields` (JSON members, or NULL), then `text` escaped (or none).
  */

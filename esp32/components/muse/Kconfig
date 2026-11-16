@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# Modified for the North Pole Santa Communicator: adds MUSE_FULLSCREEN_ART.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -163,6 +162,31 @@ menu "Muse"
             Without it those characters show as boxes. Hangul isn't
             included.
 
+    config MUSE_WAKE_WORD
+        bool "\"Hey Santa\" wake word starts a talk turn"
+        depends on MUSE_HATCH && SPIRAM && IDF_TARGET_ESP32S3
+        default n
+        help
+            While the screen is awake and Muse is idle, the mic listens for
+            "hey Santa" (a microWakeWord model, components/muse/wake/, run
+            with esp-tflite-micro). Hearing it starts a turn as a talk press
+            does: LISTENING shows and the speech goes to Muse. With no
+            button to let go of, that turn ends after a short silence once
+            speech has started (or with nothing said, quietly drops), and
+            the talk button, a click with MUSE_TALK_TOGGLE, still ends it
+            too. It doesn't listen while asleep, in the menu, during a
+            story, or while Muse is speaking.
+
+    config MUSE_WAKE_WORD_CUTOFF
+        int "Wake word cutoff (percent)"
+        depends on MUSE_WAKE_WORD
+        range 50 99
+        default 97
+        help
+            The mean model probability over 5 runs (150 ms) that counts
+            as hearing it: higher misses more, lower false-wakes more.
+            97 is hey_santa.json's probability_cutoff.
+
     config MUSE_FULLSCREEN_ART
         bool "Avatar is a full-screen picture"
         depends on MUSE_ENABLED
@@ -174,6 +198,163 @@ menu "Muse"
             button hint icons and the status line (Wi-Fi, Bluetooth, battery)
             are not drawn over it on the main screen. Captions, the bottom
             state bar, menus, settings and pop-ups still show.
+
+    config MUSE_TALK_TOGGLE
+        bool "Talk button toggles recording"
+        depends on MUSE_ENABLED
+        default n
+        help
+            One click of the talk button starts recording and the next
+            click stops and sends; releasing the button does nothing.
+            A note still stops on its own after 15 s, and the next click
+            then starts a new one. A click while Muse is thinking or
+            speaking cuts in and starts a new note, as a press does.
+            Waking, pairing confirm and menu Select work as with
+            push-to-talk. Off: hold to talk.
+
+    config MUSE_MENU_DOUBLE_PRESS
+        bool "Menu button: double press opens the menu"
+        depends on MUSE_ENABLED
+        default n
+        help
+            For boards without touch, where the aux button opens the menu.
+            On the main screen a single press does nothing (it still wakes
+            a sleeping screen), a double press opens the menu and four
+            presses toggle phone setup (Bluetooth pairing). Presses count
+            as one run while each comes within 350 ms of the last, and the
+            run acts once they stop. In the menu each press steps down it
+            at once, as before. Off: one press opens the menu.
+
+    menu "North Pole Santa Communicator extras"
+        depends on MUSE_FULLSCREEN_ART
+        comment "Need the NPSC avatar (avatar/npsc_screens.h, npsc_jingle.h)"
+
+    config MUSE_NPSC_COUNTDOWN
+        bool "Sleeps-to-Christmas count under the idle art"
+        default n
+        help
+            Once the clock is set over the network (SNTP, after Wi-Fi joins;
+            time zone America/Los_Angeles), the idle screen switches to a
+            layout with "<N> sleeps" under the tree, counting days to
+            December 25 (next year's after it). On Christmas Day it reads
+            "Merry Christmas!". Until the clock is set the approved idle art
+            shows unchanged.
+
+    config MUSE_NPSC_WAKE_SPLASH
+        bool "Sleeps countdown splash on waking"
+        default n
+        help
+            For 3 s after the screen wakes (clock set, not Christmas
+            Day) a full-screen countdown splash shows. Its art is a
+            placeholder: screens/wake.png from design/make_feature_screens.py
+            (scr_wake), number box drawn in avatar/muse_pixel.c (LAYOUT_WAKE).
+
+    config MUSE_NPSC_STORY
+        bool "Story time: three presses of MENU"
+        depends on MUSE_HATCH && MUSE_MENU_DOUBLE_PRESS
+        default n
+        help
+            Three presses of MENU on the main screen tell one of ten short
+            (about 45 second) Christmas bedtime stories, word for word, in the
+            ElevenLabs voice (MUSE_ELEVENLABS_API_KEY) while the STORY TIME
+            screen shows; Muse isn't asked, but Wi-Fi is needed. Each story
+            plays once, in random order, before any repeats. The kid's name
+            (MUSE_NPSC_PARENT) is said in each, or "my friend" with none set.
+            A press of either button stops it. The stories are in
+            avatar/npsc_stories.h, built by design/make_stories.py; sources
+            and licenses are in design/CREDITS.md.
+
+    config MUSE_NPSC_ELF
+        bool "Elf on Duty at bedtime"
+        default n
+        help
+            At bedtime (menu: Bedtime, default 8:00 pm; clock must be set)
+            the screen wakes to a dim sleepy-Santa page with the backlight
+            lowered, and Santa says a short goodnight through Muse (or, when
+            Muse can't be reached, the jingle plays if that is enabled).
+            Any press goes back to normal.
+
+    config MUSE_NPSC_TRACKER
+        bool "Christmas Eve sleigh tracker (simulated)"
+        default n
+        help
+            On December 24 from 5 pm local time the idle screen shows
+            "Santa's sleigh is over... <place>", from a made-up route in
+            muse_npsc.c keyed to the clock and arriving around midnight. No
+            network data is used.
+
+    config MUSE_NPSC_JINGLE
+        bool "Jingle: five presses of MENU"
+        depends on MUSE_MENU_DOUBLE_PRESS
+        default n
+        help
+            Five presses of MENU on the main screen play a 3.3 s sleigh-bell
+            recording stored in flash ("Sleigh bells.wav" by The Midnite
+            Wolf, Wikimedia Commons, CC0) and show the JINGLE! screen.
+
+    config MUSE_NPSC_WAKE_RECORD
+        bool "Hey Santa recording: four presses of MENU"
+        depends on MUSE_HATCH && MUSE_MENU_DOUBLE_PRESS && MUSE_WAKE_WORD
+        default y
+        help
+            Four presses of MENU on the main screen start a five-round
+            "Hey Santa" recording session. Santa (the ElevenLabs voice,
+            same as story time; needs Wi-Fi) says "Let's do a test of
+            five. I'll cue you each time.", then each round plays a
+            short beep and records the child saying "hey santa". Rounds
+            2-5 are cued with "Again!". A round is kept if speech starts
+            within 5 s, and ends 1 s after the last word, or at 3 s.
+            Silence for 5 s skips the round. Clips stay in PSRAM until
+            reboot (16 kHz 16-bit mono). The console command "clips"
+            writes them as WAV over the USB serial port. A press of
+            either button stops the session. The wake word does not
+            start a conversation while this runs. These are children's
+            voices: do not upload them or put them in a public repo.
+
+    config MUSE_NPSC_PARENT
+        bool "Kid's name: menu entry and wake greeting"
+        default n
+        help
+            Adds "Kid's name" to the menu: an on-device letter picker (MENU
+            next letter, COMMUNICATE picks; Space, Delete and Done at the
+            end of the letters). The name is kept in flash (NVS) and can also
+            be set with the Bluetooth/console command kid.name=<name>. On
+            waking, "Ho ho ho, <name>!" shows briefly, and stories and
+            goodnights ask Santa to use the name.
+
+    config MUSE_NPSC_KID_NAME_DEFAULT
+        string "Kid's name until one is picked"
+        depends on MUSE_NPSC_PARENT
+        default ""
+        help
+            Used until a name is set from the menu or with kid.name (those
+            are kept in NVS and win, even when set empty). Up to 24
+            characters; two names read naturally, e.g. "Alex and Sam".
+
+    config MUSE_NPSC_BOOT_SHOW_MS
+        int "How long the power-on screen shows (ms)"
+        range 0 10000
+        default 1400
+        help
+            At power-on the picture shows with "WAKING UP..." while the
+            boot finishes; this is how long, in milliseconds, before the
+            voice pipeline, Wi-Fi and the rest start and the screen goes to
+            idle (with the wake greeting and splash). Upstream waits 1400.
+            Longer holds also put off Wi-Fi by the difference.
+
+    endmenu
+
+    config MUSE_NPSC
+        bool
+        default y if MUSE_NPSC_COUNTDOWN || MUSE_NPSC_WAKE_SPLASH || MUSE_NPSC_STORY || MUSE_NPSC_ELF || MUSE_NPSC_TRACKER || MUSE_NPSC_JINGLE || MUSE_NPSC_WAKE_RECORD || MUSE_NPSC_PARENT
+
+    config MUSE_NPSC_CLOCK
+        bool
+        default y if MUSE_NPSC_COUNTDOWN || MUSE_NPSC_WAKE_SPLASH || MUSE_NPSC_ELF || MUSE_NPSC_TRACKER
+
+    config MUSE_NPSC_SPOKEN
+        bool
+        default y if MUSE_HATCH && (MUSE_NPSC_STORY || MUSE_NPSC_ELF)
 
     config MUSE_JC3248W535_MIC_GPIO
         int "JC3248W535: GPIO for an external I2S mic's data (SD) line"
@@ -226,5 +407,15 @@ menu "Muse"
         help
             eleven_flash_v2_5 answers fastest and speaks 32 languages;
             eleven_multilingual_v2 sounds richer but starts later.
+
+    config MUSE_ELEVENLABS_LANGUAGE
+        string "ElevenLabs speech language (ISO 639-1)"
+        depends on MUSE_HATCH
+        default "en"
+        help
+            Sent as language_code so the multilingual flash/turbo models
+            speak (and read numbers and dates) in this language instead of
+            guessing it from the text and the voice. Empty: not sent.
+            eleven_multilingual_v2 doesn't take it and ignores it.
 
 endmenu

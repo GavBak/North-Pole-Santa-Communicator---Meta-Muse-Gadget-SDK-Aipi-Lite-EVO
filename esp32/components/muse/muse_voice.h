@@ -17,6 +17,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
@@ -48,6 +49,20 @@ void muse_voice_request_loopback(void);
 
 /* Bench test: decodes and plays a built-in MP3 reply. */
 void muse_voice_request_mp3test(void);
+
+/* Recording a note right now (from the first chunk to the last, whatever
+ * ended it: release, MAX_SECS or a failure). */
+bool muse_voice_recording(void);
+/* How many recordings have started since boot; a press-to-start that hasn't
+ * become a recording yet leaves it unchanged. */
+uint32_t muse_voice_recordings_started(void);
+
+/* North Pole extras (CONFIG_MUSE_NPSC_*). Stop: the reply playing now, or the
+ * next within 70 s, ends quietly instead of being cut into by a recording;
+ * clear forgets a stop. Jingle: the bells, if the speaker is on. */
+void muse_voice_stop_reply(void);
+void muse_voice_clear_stop(void);
+void muse_voice_request_jingle(void);
 
 /* Asleep with nothing to play: codecs off, Wi-Fi dozing. */
 bool muse_voice_resting(void);
