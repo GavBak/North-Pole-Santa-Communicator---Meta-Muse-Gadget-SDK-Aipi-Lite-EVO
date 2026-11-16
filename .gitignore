@@ -45,3 +45,9 @@ sdkconfig.old
 *.zip
 *.log
 design/*.ttf
+# Wake-word weights stay local. Place hey_santa.tflite in
+# esp32/components/muse/wake/ and rebuild; the firmware leaves the word off
+# until that file is there.
+esp32/components/muse/wake/*.tflite
+# Clips from tools/npsc/pull_clips.py are children's voices.
+*.wav

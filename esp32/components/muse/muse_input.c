@@ -39,6 +39,7 @@
 #include "muse_link.h"
 #include "muse_mem.h"
 #include "muse_menu.h"
+#include "muse_npsc.h"
 #include "muse_pixel.h"
 #include "muse_settings.h"
 #include "muse_state.h"
@@ -183,15 +184,133 @@ static void aux_button(bool pressed, bool edge)
     }
 }
 
+#if CONFIG_MUSE_TALK_TOGGLE
+/*
+ * Toggle talk: a click starts a note and the next click sends it; releases
+ * don't count. Whether a note is going on comes from muse_voice, so one that
+ * ended on its own (MAX_SECS, a failure, HOLD LONGER) leaves the next click
+ * starting a new one. Between a start click and the voice task beginning to
+ * record (up to ~0.3 s when it wakes the board) the click counts as pending,
+ * so a second click then cancels it rather than starting another.
+ */
+#define TOGGLE_PENDING_MS 1500
+static bool s_toggle_pending;
+static uint32_t s_toggle_starts;   /* muse_voice_recordings_started() at the start click */
+static TickType_t s_toggle_at;
+
+static bool talk_toggled_on(void)
+{
+    if (muse_voice_recording()) {
+        s_toggle_pending = false;
+        return true;
+    }
+    if (s_toggle_pending && muse_voice_recordings_started() == s_toggle_starts &&
+        xTaskGetTickCount() - s_toggle_at < pdMS_TO_TICKS(TOGGLE_PENDING_MS)) {
+        return true;
+    }
+    s_toggle_pending = false;   /* it ran and ended, or never started */
+    return false;
+}
+
+static void toggle_start(bool wake)
+{
+    s_toggle_starts = muse_voice_recordings_started();
+    s_toggle_at = xTaskGetTickCount();
+    s_toggle_pending = true;
+    post(MUSE_PTT_DOWN, wake);
+}
+#endif
+
+/* The talk button is down for push-to-talk, or toggled on. */
+static bool talk_active(void)
+{
+#if CONFIG_MUSE_TALK_TOGGLE
+    return talk_toggled_on();
+#else
+    return s_talk_down;
+#endif
+}
+
+#if CONFIG_MUSE_MENU_DOUBLE_PRESS
+/*
+ * On the main screen presses are counted, and the count acts once they stop
+ * (MENU_PRESS_GAP_MS after the last one), so a run of four is never also
+ * read as a double: two open the menu, three start story time
+ * (CONFIG_MUSE_NPSC_STORY), four start a "hey santa" recording session
+ * (CONFIG_MUSE_NPSC_WAKE_RECORD), five play the jingle
+ * (CONFIG_MUSE_NPSC_JINGLE), eight toggle phone setup, any other count does nothing. A press that wakes the screen only wakes it, and once
+ * the menu is open each press steps down it at once, as before.
+ */
+#define MENU_PRESS_GAP_MS 350
+static int s_menu_presses;
+static TickType_t s_menu_press_at;
+
+static void menu_presses_settle(void)
+{
+    if (!s_menu_presses || xTaskGetTickCount() - s_menu_press_at < pdMS_TO_TICKS(MENU_PRESS_GAP_MS)) {
+        return;
+    }
+    int n = s_menu_presses;
+    s_menu_presses = 0;
+    if (muse_state_asleep() || muse_menu_is_open() || talk_active()) {
+        return;
+    }
+    ESP_LOGI(TAG, "menu button: %d press%s", n, n == 1 ? "" : "es");
+    if (n == 2) {
+        muse_menu_key(MUSE_MENU_DOWN);   /* opens the menu */
+    } else if (n == 8) {
+        toggle_phone_setup();
+#if CONFIG_MUSE_NPSC_STORY
+    } else if (n == 3) {
+        muse_npsc_story_start();
+#endif
+#if CONFIG_MUSE_NPSC_WAKE_RECORD
+    } else if (n == 4) {
+        muse_npsc_wake_record_start();
+#endif
+#if CONFIG_MUSE_NPSC_JINGLE
+    } else if (n == 5) {
+        muse_npsc_jingle();
+#endif
+    }
+}
+#endif
+
 /* No touch: the aux button opens the menu and steps down it; any press wakes. */
 static void menu_button(bool pressed, bool edge)
 {
+#if CONFIG_MUSE_MENU_DOUBLE_PRESS
+    menu_presses_settle();
+    if (!edge || !pressed) {
+        return;
+    }
+#if CONFIG_MUSE_NPSC
+    if (muse_npsc_press()) {   /* stopped a story, or ended Elf on Duty */
+        s_menu_presses = 0;
+        muse_state_poke();
+        return;
+    }
+#endif
+    if (muse_state_asleep()) {
+        s_menu_presses = 0;
+        set_asleep(false, muse_board->aux_button);
+    } else if (muse_menu_is_open()) {
+        s_menu_presses = 0;
+        muse_state_poke();
+        muse_menu_key(MUSE_MENU_DOWN);
+    } else if (!talk_active()) {
+        muse_state_poke();
+        s_menu_presses++;
+        s_menu_press_at = xTaskGetTickCount();
+    }
+    return;
+#endif
     if (!edge || !pressed) {
         return;
     }
     if (muse_state_asleep()) {
         set_asleep(false, muse_board->aux_button);
-    } else if (!s_talk_down) {
+    } else if (!talk_active()) {
         muse_state_poke();
         muse_menu_key(MUSE_MENU_DOWN);
     }
@@ -211,6 +330,33 @@ static void aux_key(bool pressed, bool edge)
  * still held once awake. */
 static void talk_button(unsigned ev)
 {
+#if CONFIG_MUSE_TALK_TOGGLE
+    /* Clicks only; the same order of checks as a push-to-talk press. */
+    if (!(ev & MUSE_BTN_TALK_PRESS)) {
+        return;
+    }
+#if CONFIG_MUSE_NPSC
+    if (!talk_toggled_on() && muse_npsc_press()) {   /* stopped a story, or ended Elf on Duty */
+        muse_state_poke();
+        return;
+    }
+#endif
+    if (talk_toggled_on()) {
+        s_toggle_pending = false;
+        post(MUSE_PTT_UP, false);   /* stop and send */
+    } else if (muse_link_talk_press()) {
+        muse_state_poke();          /* confirmed a Muse app pairing */
+    } else if (muse_state_asleep()) {
+        set_asleep(false, muse_board->talk_button);
+        toggle_start(true);         /* wakes and starts a note */
+    } else if (muse_menu_is_open()) {
+        muse_state_poke();
+        if (!muse_board->keyboard) muse_menu_key(MUSE_MENU_SELECT);
+    } else {
+        toggle_start(false);        /* starts a note, or cuts in on a reply as a press does */
+    }
+    return;
+#endif
     bool talk_down = s_talk_down;
     static bool swallow;
 #if CONFIG_MUSE_WATCHER_CAMERA
@@ -240,6 +386,12 @@ static void talk_button(unsigned ev)
         released = false;
     }
     if (!talk_down && !swallow && (ev & MUSE_BTN_TALK_PRESS)) {
+#if CONFIG_MUSE_NPSC
+        if (muse_npsc_press()) {   /* stopped a story, or ended Elf on Duty */
+            muse_state_poke();
+            swallow = true;
+        } else
+#endif
         if (muse_link_talk_press()) {
             /* Confirmed a Muse app pairing (Link's setup button). */
             muse_state_poke();
@@ -277,7 +429,7 @@ static void keyboard_buttons(unsigned ev)
 {
     const unsigned mask = MUSE_BTN_UP | MUSE_BTN_DOWN | MUSE_BTN_LEFT |
                           MUSE_BTN_RIGHT | MUSE_BTN_ENTER | MUSE_BTN_ESCAPE;
-    if (!(ev & mask) || s_talk_down) return;
+    if (!(ev & mask) || talk_active()) return;
     if ((ev & MUSE_BTN_ENTER) && muse_link_talk_press()) {
         muse_state_poke();
         return;
@@ -690,6 +842,12 @@ static bool console_command(char *line, bool whole)
         fflush(stdout);
         return true;
     }
+#if CONFIG_MUSE_NPSC_WAKE_RECORD
+    if (!strcmp(line, "clips")) {
+        muse_npsc_wake_record_dump();
+        return true;
+    }
+#endif
     if (!strcmp(line, "nap")) {
         muse_state_set_as_if_battery(true);
         set_asleep(true, "serial");
@@ -729,7 +887,8 @@ static bool console_command(char *line, bool whole)
  * A line starting with '>' is a setup command, the same "key=value" text as
  * the BLE CMD characteristic, or one of the console's own: "status" prints
  * the device's state, "power" the battery meter (muse_battery.h) and
- * "power.reset" starts it over, "nap" sleeps and leaves Wi-Fi at once (as
+ * "power.reset" starts it over, "clips" writes stored "hey santa"
+ * recordings as WAV (CONFIG_MUSE_NPSC_WAKE_RECORD), "nap" sleeps and leaves Wi-Fi at once (as
  * two minutes asleep on battery would; 'w' rejoins), "face=" shows a face
  * (see set_face), and "chat=" sends a typed message to Hatch (see chat_line
  * and tools/muse/chat.py).

@@ -86,3 +86,7 @@ dependencies:
     version: "1.2.1"
     rules:
       - if: "$CONFIG{MUSE_BOARD_ID} == \"waveshare_s3_lcd7\""
+  espressif/esp-tflite-micro:
+    version: "1.4.3"
+    rules:
+      - if: "$CONFIG{MUSE_WAKE_WORD} == True"

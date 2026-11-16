@@ -32,6 +32,7 @@
 #include "muse_state.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#include "muse_npsc.h"
 
 static const char *TAG = "muse_ble";
 
@@ -171,6 +172,10 @@ static void run_command(char *cmd)
         muse_settings_set_brightness(n);
     } else if (!strcmp(cmd, "sleep") && parse_int(v, 0, 3600, &n)) {
         muse_settings_set_sleep_s(n);
+#if CONFIG_MUSE_NPSC_PARENT
+    } else if (!strcmp(cmd, "kid.name")) {
+        muse_npsc_set_name(v);   /* the greeting and Santa's stories use it */
+#endif
     } else {
         res = "error: unknown command or bad value";
     }

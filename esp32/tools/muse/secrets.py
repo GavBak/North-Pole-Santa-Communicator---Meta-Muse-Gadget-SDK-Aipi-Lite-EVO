@@ -34,6 +34,8 @@ SECRETS = (
     ("CONFIG_GADGET_SDK_TOKEN", "MUSE_SDK_TOKEN", "muse_sdk_token"),
     ("CONFIG_MUSE_ELEVENLABS_API_KEY", "ELEVENLABS_API_KEY", "elevenlabs_api_key"),
     ("CONFIG_MUSE_ELEVENLABS_VOICE_ID", "ELEVENLABS_VOICE_ID", "elevenlabs_voice_id"),
+    ("CONFIG_MUSE_DEFAULT_WIFI_SSID", "MUSE_WIFI_SSID", "wifi_ssid"),
+    ("CONFIG_MUSE_DEFAULT_WIFI_PASSWORD", "MUSE_WIFI_PASSWORD", "wifi_password"),
 )
 
 

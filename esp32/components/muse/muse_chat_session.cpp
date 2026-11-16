@@ -131,7 +131,7 @@ static const char *TAG = "muse_chat_session";
 
 /* ---- Voice task <-> session task ---- */
 
-enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };
+enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_SPOKEN, CMD_SAY };
 
 struct cmd_t {
     cmd_type_t type;
@@ -216,6 +216,7 @@ struct turn_t {
     phase_t phase;
     uint32_t gen;
     bool text;               /* typed at the console: the reply goes there, unspoken */
+    bool local;              /* muse_hatch_say: the gadget's own text, spoken without Muse */
     bool end_requested, end_sent, chat_posted, acked;
     int64_t dict_id, chat_id;
     int64_t start_us, end_sent_us, chat_us, last_event_us, last_content_us;
@@ -992,8 +993,8 @@ static void turn_done(bool complete)
     turn_finish();
 }
 
-/* Ends any turn in progress and starts a fresh one. False if Hatch can't be reached. */
-static bool turn_start(uint32_t gen, bool text)
+/* Ends any turn in progress and clears the turn for a fresh one. */
+static void turn_reset(uint32_t gen, bool text)
 {
     if (s_turn.phase != P_IDLE) {
         if (s_turn.text) {
@@ -1016,6 +1017,12 @@ static bool turn_start(uint32_t gen, bool text)
     s_reply_shown[0] = '\0';
     s_turn.start_us = now_us();
     resampler_init(&s_turn.up, MIC_RATE, DICT_RATE);
+}
+
+/* Ends any turn in progress and starts a fresh one. False if Hatch can't be reached. */
+static bool turn_start(uint32_t gen, bool text)
+{
+    turn_reset(gen, text);
     if (!ensure_connected()) {
         turn_fail(muse_hatch_configured() ? "CAN'T REACH MUSE" : "MUSE NOT SET UP");
         return false;
@@ -1341,6 +1348,63 @@ static void push_begin(const char *id)
 }
 
 static const char *msg_id(cJSON *payload, cJSON *event);
+static void append_text(struct msg_t &m, const char *text);
+static bool tts_enabled(void);
+
+#if CONFIG_MUSE_NPSC_SPOKEN
+/* muse_hatch_spoken_turn: send the text, then let the voice task play the
+ * reply like a push. A failure is played too: the voice task shows its error. */
+static void spoken_begin(const char *text)
+{
+    if (s_turn.phase != P_IDLE || muse_state_mode(nullptr) != MUSE_MODE_IDLE || s_push_pending.load()) {
+        ESP_LOGI(TAG, "spoken turn: busy, dropped");
+        return;
+    }
+    uint32_t gen = ++s_gen;
+    if (turn_start(gen, false)) {
+        ESP_LOGI(TAG, "spoken turn: %u bytes", (unsigned)strlen(text));
+        send_chat(text, "text");
+    }
+    s_push_pending = true;
+}
+#endif
+
+#if CONFIG_MUSE_NPSC_STORY || CONFIG_MUSE_NPSC_WAKE_RECORD
+/*
+ * muse_hatch_say: a turn of the gadget's own, with no Muse in it. The text
+ * is the turn's one message, already complete; start_tts() sends it to
+ * ElevenLabs and decode() plays it, as it would a reply, while the voice task
+ * plays the turn like a push (so a press stops it, and a press of TALK ends
+ * it for a turn of its own). Needs Wi-Fi only. No speech: SAY_FAIL.
+ */
+#define SAY_FAIL "STORIES NEED WI-FI"
+
+static void say_begin(const char *text)
+{
+    if (s_turn.phase != P_IDLE || muse_state_mode(nullptr) != MUSE_MODE_IDLE || s_push_pending.load()) {
+        ESP_LOGI(TAG, "say: busy, dropped");
+        return;
+    }
+    uint32_t gen = ++s_gen;
+    turn_reset(gen, false);
+    s_turn.local = true;
+    s_push_pending = true;   /* the voice task plays it, or shows why not */
+    if (!s_turn.texts || !tts_enabled() || !muse_wifi_connected()) {
+        turn_fail(SAY_FAIL);
+        return;
+    }
+    msg_t &m = s_turn.msgs[0];
+    m = msg_t{};
+    strlcpy(m.id, "local-say", sizeof(m.id));
+    append_text(m, text);
+    m.done = true;
+    m.tts = TTS_QUEUED;
+    s_turn.nmsgs = 1;
+    s_turn.phase = P_WAIT_REPLY;
+    s_turn.chat_us = s_turn.last_event_us = s_turn.last_content_us = now_us();
+    ESP_LOGI(TAG, "say: %u chars", (unsigned)m.len);
+}
+#endif
 
 /* An assistant message starting with no turn waiting: a push, unless it's
  * one already shown. on_event calls this before its turn checks. */
@@ -1373,7 +1437,7 @@ static bool is_user_id(const char *id)
 /* The message `id` if it belongs to this turn, binding it on first sight; else -1. */
 static int bind_msg(const char *id, cJSON *payload)
 {
-    if (muse_chat_is_rejected(&s_turn.rejected, id)) {
+    if (muse_chat_is_rejected(&s_turn.rejected, id) || s_turn.local) {
         return -1;
     }
     int i = find_msg(id);
@@ -1628,6 +1692,11 @@ static bool tts_fetch(const tts_job_t &j)
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "text", j.text);
     cJSON_AddStringToObject(req, "model_id", CONFIG_MUSE_ELEVENLABS_MODEL);
+    if (CONFIG_MUSE_ELEVENLABS_LANGUAGE[0]) {
+        /* Flash/Turbo v2.5 guess the language from the text and the voice;
+         * this pins it (ignored by models that don't take it). */
+        cJSON_AddStringToObject(req, "language_code", CONFIG_MUSE_ELEVENLABS_LANGUAGE);
+    }
     char *body = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
     if (!body) {
@@ -1737,7 +1806,7 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        if (tts_enabled() && s_turn.texts && muse_settings_speaker_on()) {
+        if (tts_enabled() && s_turn.texts && (muse_settings_speaker_on() || s_turn.local)) {
             if (s_tts_busy.load()) {
                 return;   /* a cancelled fetch is still winding down */
             }
@@ -1758,6 +1827,12 @@ static void start_tts(void)
                 return;
             }
         }
+#if CONFIG_MUSE_NPSC_STORY || CONFIG_MUSE_NPSC_WAKE_RECORD
+        if (s_turn.local) {
+            turn_fail(SAY_FAIL);
+            return;
+        }
+#endif
         /*
          * Replies are text, shown at reading pace: silence in place of speech
          * paces the captions and ends the turn. To speak them instead, send
@@ -1837,6 +1912,12 @@ static void tts_pump(void)
         s_turn.mp3_ended = true;   /* decode() drains the rest, then finishes */
         return;
     }
+#if CONFIG_MUSE_NPSC_STORY || CONFIG_MUSE_NPSC_WAKE_RECORD
+    if (s_turn.local) {
+        turn_fail(SAY_FAIL);
+        return;
+    }
+#endif
     m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
     s_turn.silent = true;
 }
@@ -1954,7 +2035,7 @@ static void check_turn(void)
             return;
         }
     }
-    if (t - s_turn.last_event_us < SETTLE_US) {
+    if (!s_turn.local && t - s_turn.last_event_us < SETTLE_US) {
         return;
     }
     if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
@@ -2150,7 +2231,7 @@ static bool poll_socket(void)
 
 static void drop_connection(const char *why)
 {
-    bool in_turn = s_turn.phase != P_IDLE;
+    bool in_turn = s_turn.phase != P_IDLE && !s_turn.local;
     disconnect(why);
     s_auto_next_us = now_us() + s_auto_backoff_us;
     if (in_turn) {
@@ -2208,6 +2289,18 @@ static void handle(const cmd_t &cmd)
         break;
     case CMD_WAKE:   /* only ends hatch_task's resting wait */
         break;
+    case CMD_SPOKEN:
+#if CONFIG_MUSE_NPSC_SPOKEN
+        spoken_begin(cmd.text);
+#endif
+        free(cmd.text);
+        break;
+    case CMD_SAY:
+#if CONFIG_MUSE_NPSC_STORY || CONFIG_MUSE_NPSC_WAKE_RECORD
+        say_begin(cmd.text);
+#endif
+        free(cmd.text);
+        break;
     }
 }
 
@@ -2219,7 +2312,8 @@ static void hatch_task(void *arg)
         /* Resting, the socket's keepalive (PING_US) needs no quicker polls.
          * Resting unconnected, Wi-Fi may nap (muse_wifi_nap): wait for a
          * turn or for waking (CMD_WAKE) instead of watching it. */
-        int wait_ms = !s_connected ? (s_resting ? -1 : 200) : s_turn.phase != P_IDLE ? 2 : s_resting ? 500 : 20;
+        bool local = s_turn.local && s_turn.phase != P_IDLE;
+        int wait_ms = local ? 2 : !s_connected ? (s_resting ? -1 : 200) : s_turn.phase != P_IDLE ? 2 : s_resting ? 500 : 20;
         TickType_t wait = wait_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
         if (xQueueReceive(s_cmds, &cmd, wait) == pdTRUE) {
             handle(cmd);
@@ -2227,10 +2321,20 @@ static void hatch_task(void *arg)
                 handle(cmd);
             }
         }
+        /* A local turn (muse_hatch_say) plays with or without Muse. */
+        local = s_turn.local && s_turn.phase == P_WAIT_REPLY;
+        if (local) {
+            start_tts();
+            tts_pump();
+            decode();
+            check_turn();
+        }
         if (!s_connected) {
             if (!muse_wifi_connected()) {
                 s_auto_next_us = 0;
                 s_auto_backoff_us = AUTO_RETRY_MIN_US;
+            } else if (local) {
+                /* Connecting would stall the speech; it waits for the end. */
             } else if (muse_hatch_configured()
                        && (now_us() >= s_auto_next_us || (s_auto_next_us == INT64_MAX && muse_settings_pushes_on()))) {
                 /* Closed when idle, then All messages turned on: connect again for pushes. */
@@ -2263,7 +2367,7 @@ static void hatch_task(void *arg)
             drop_connection("send failed");
             continue;
         }
-        if (s_turn.phase == P_WAIT_REPLY) {
+        if (s_turn.phase == P_WAIT_REPLY && !s_turn.local) {
             start_tts();
             tts_pump();
             decode();
@@ -2271,7 +2375,9 @@ static void hatch_task(void *arg)
         if (!s_connected) {
             continue;
         }
-        check_turn();
+        if (!local) {
+            check_turn();
+        }
 
         int64_t t = now_us();
         if (t - s_conn.last_rx_us > DEAD_US) {
@@ -2424,6 +2530,28 @@ extern "C" void muse_hatch_text_turn(char *text)
         muse_hatch_console("error", "BUSY", nullptr);
         free(text);
     }
+}
+
+extern "C" bool muse_hatch_spoken_turn(char *text)
+{
+    cmd_t cmd{ CMD_SPOKEN, 0, text };
+    if (!s_cmds || !muse_hatch_configured() || xQueueSend(s_cmds, &cmd, pdMS_TO_TICKS(500)) != pdTRUE) {
+        free(text);
+        return false;
+    }
+    return true;
+}
+
+extern "C" bool muse_hatch_say(char *text)
+{
+#if CONFIG_MUSE_NPSC_STORY || CONFIG_MUSE_NPSC_WAKE_RECORD
+    cmd_t cmd{ CMD_SAY, 0, text };
+    if (s_cmds && xQueueSend(s_cmds, &cmd, pdMS_TO_TICKS(500)) == pdTRUE) {
+        return true;
+    }
+#endif
+    free(text);
+    return false;
 }
 
 extern "C" void muse_hatch_text_cancel(void)

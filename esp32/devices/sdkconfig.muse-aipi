@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# Modified for the North Pole Santa Communicator (see the end of this file).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,22 +65,53 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
 
-# --- North Pole Santa Communicator additions (ElevenLabs spoken replies) ---
+# --- Santa build additions (ElevenLabs spoken replies) ---
 # Model pinned explicitly (also the Kconfig default). The voice ID is NOT
-# set here: it comes from secrets/elevenlabs_voice_id (or ELEVENLABS_VOICE_ID),
-# injected into the generated sdkconfig at build time by esp32/tools/muse/secrets.py.
+# set here: it comes from secrets/elevenlabs_voice_id, injected into the
+# generated sdkconfig at build time by esp32/tools/muse/secrets.py.
 CONFIG_MUSE_ELEVENLABS_MODEL="eleven_flash_v2_5"
 # api.elevenlabs.io presents a GTS Root R1 chain cross-signed by GlobalSign;
 # without this the TLS verify against the stock cert bundle can fail
 # (the fork sets the same flag in its Waveshare device overlays).
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
 # CONFIG_MUSE_ELEVENLABS_API_KEY is deliberately NOT set here. It stays
-# empty (= spoken replies off) until you create secrets/elevenlabs_api_key
-# with your own key (or set ELEVENLABS_API_KEY); secrets.py injects it at build time.
+# empty (= spoken replies off) until Gav creates secrets/elevenlabs_api_key
+# with his own key; secrets.py injects it at build time.
 
 # NORTH POLE / SANTA COMMUNICATOR screen: components/muse/avatar/muse_pixel.c
-# (with npsc_art.h) is a full-screen 128x128 picture rather than a
+# (gitignored, with npsc_art.h) is a full-screen 128x128 picture rather than a
 # character, so the canvas fills the panel and no hint icons or status line
 # are drawn over it. Remove this line along with that avatar/ folder to go
 # back to the default avatar.
 CONFIG_MUSE_FULLSCREEN_ART=y
+
+# Talk button (bottom right) toggles: click to start talking, click again to
+# send. Releases don't count; a note still stops on its own after 15 s.
+CONFIG_MUSE_TALK_TOGGLE=y
+
+# Menu button (bottom left): a single press only wakes the screen, a double
+# press opens the menu, four presses toggle phone setup (Bluetooth pairing);
+# with the extras below, three start story time and five play the jingle.
+CONFIG_MUSE_MENU_DOUBLE_PRESS=y
+# North Pole Santa Communicator extras (components/muse/Kconfig, muse_npsc.c):
+# sleeps count under the art, wake splash, story time (3 presses of MENU),
+# Elf on Duty at bedtime, Christmas Eve sleigh tracker (simulated), jingle
+# (5 presses of MENU), kid's name + wake greeting.
+CONFIG_MUSE_NPSC_COUNTDOWN=y
+CONFIG_MUSE_NPSC_WAKE_SPLASH=y
+CONFIG_MUSE_NPSC_STORY=y
+CONFIG_MUSE_NPSC_ELF=y
+CONFIG_MUSE_NPSC_TRACKER=y
+CONFIG_MUSE_NPSC_JINGLE=y
+CONFIG_MUSE_NPSC_PARENT=y
+CONFIG_MUSE_NPSC_BOOT_SHOW_MS=5000
+# Greeting and Santa's stories use this until a name is picked in the menu
+# (build tree only; the public fork leaves it empty).
+CONFIG_MUSE_NPSC_KID_NAME_DEFAULT=""
+
+# "Hey Santa" wake word. The weights are not in git: put
+# components/muse/wake/hey_santa.tflite in place (gitignored) and rebuild.
+# Without that file this stays on and the word stays off.
+CONFIG_MUSE_WAKE_WORD=y
+CONFIG_MUSE_NPSC_WAKE_RECORD=y
+CONFIG_MUSE_ELEVENLABS_LANGUAGE="en"

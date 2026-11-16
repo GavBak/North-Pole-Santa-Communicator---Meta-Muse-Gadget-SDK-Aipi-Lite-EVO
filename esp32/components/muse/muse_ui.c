@@ -1,8 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * Modified for the North Pole Santa Communicator: CONFIG_MUSE_FULLSCREEN_ART.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -48,6 +46,7 @@
 #include "muse_text.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#include "muse_npsc.h"
 #if CONFIG_MUSE_WATCHER_CAMERA
 #include "boards/watcher_camera.h"
 #endif
@@ -1495,6 +1494,12 @@ static bool update_sleep(void)
                 target = s_preview_brightness;
             }
         }
+#if CONFIG_MUSE_NPSC
+        int dim = muse_npsc_dim_pct();   /* Elf on Duty */
+        if (dim >= 0 && dim < target) {
+            target = dim;
+        }
+#endif
         apply_brightness(target);
     }
     return s_dark;
@@ -1717,13 +1722,20 @@ static void update_status(muse_mode_t mode, float now)
             lv_arc_set_value(s_ring, ring);
             s_ring_value = ring;
         }
+    } else if (mode == MUSE_MODE_THINKING) {
+        /* Hidden while thinking: the art's star and edge glow carry that
+         * state instead of the 3 px sliding segment. */
+        if (s_ring_value != 0) {
+            lv_obj_set_width(s_bar, 0);
+            s_ring_value = 0;
+        }
     } else {
-        /* Bar along the bottom edge; a sliding segment while thinking. */
-        int x = mode == MUSE_MODE_THINKING ? (int)(now * s_w) % s_w : 0;
+        /* Bar along the bottom edge: a left-origin progress fill while
+         * listening or speaking. */
         int w = ring * s_w / RING_RANGE;
-        if (ring != s_ring_value || x) {
+        if (ring != s_ring_value) {
             lv_obj_set_width(s_bar, w);
-            lv_obj_align(s_bar, LV_ALIGN_BOTTOM_LEFT, x, 0);
+            lv_obj_align(s_bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
             s_ring_value = ring;
         }
     }

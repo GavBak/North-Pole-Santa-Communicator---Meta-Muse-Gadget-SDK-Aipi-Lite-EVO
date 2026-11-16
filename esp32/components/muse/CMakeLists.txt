@@ -21,6 +21,7 @@
 # from idf_component.yml, where rules keep them out of Link-only builds.
 set(srcs)
 set(embed)
+set(priv_includes)
 if(CONFIG_MUSE_ENABLED)
     list(APPEND srcs
         "muse_app.c"
@@ -50,6 +51,42 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
     endif()
     list(APPEND srcs "muse_chat_text.c")
+    if(CONFIG_MUSE_NPSC)
+        list(APPEND srcs "muse_npsc.c")   # North Pole extras (needs the NPSC avatar)
+    endif()
+    if(CONFIG_MUSE_WAKE_WORD)
+        # "Hey Santa": microWakeWord model on esp-tflite-micro, with the TF
+        # micro frontend (wake/, Apache-2.0) that made its training features.
+        list(APPEND srcs "muse_wake.cpp"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/fft.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/fft_util.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/filterbank.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/filterbank_util.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/frontend.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/frontend_util.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/kiss_fft_int16.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/log_lut.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/log_scale.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/log_scale_util.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/noise_reduction.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/noise_reduction_util.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/pcan_gain_control.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/pcan_gain_control_util.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/window.cc"
+            "wake/tensorflow/lite/experimental/microfrontend/lib/window_util.cc")
+        # Weights are not published. Drop hey_santa.tflite in wake/ (gitignored)
+        # and rebuild to embed it. Without the file the wake word stays off
+        # and the link still succeeds.
+        if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/wake/hey_santa.tflite")
+            list(APPEND embed "wake/hey_santa.tflite")
+            set(muse_wake_model_embedded 1)
+        else()
+            message(WARNING
+                "components/muse/wake/hey_santa.tflite is not in the tree (gitignored). "
+                "Hey Santa stays off until that file is added and the firmware is rebuilt.")
+        endif()
+        list(APPEND priv_includes "wake" "wake/kissfft")
+    endif()
     if(CONFIG_MUSE_CJK_FONT)
         list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback
     endif()
@@ -114,17 +151,22 @@ set(muse_priv_requires
     bt esp-tls mbedtls esp_app_format esp_http_client
     noise_core minimp3
     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
-    esp_driver_pcnt)
+    esp_driver_pcnt esp_netif)
 list(APPEND muse_priv_requires camera)
 
 idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "."
+    PRIV_INCLUDE_DIRS ${priv_includes}
     EMBED_FILES ${embed}
     WHOLE_ARCHIVE   # muse_lv_mem.c provides symbols only LVGL references
     REQUIRES esp_driver_gpio esp_driver_i2c
     PRIV_REQUIRES ${muse_priv_requires}
 )
+
+if(muse_wake_model_embedded)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE MUSE_WAKE_MODEL_EMBEDDED=1)
+endif()
 
 if(CONFIG_MUSE_ENABLED)
     # LVGL spins forever on a failed assert unless LV_ASSERT_HANDLER is set,

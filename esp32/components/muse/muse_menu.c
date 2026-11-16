@@ -15,6 +15,7 @@
  */
 
 #include "muse_menu.h"
+#include "muse_npsc.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -62,6 +63,12 @@ static const char *TAG = "muse_menu";
  * needs a long press or a third button.
  */
 typedef enum {
+#if CONFIG_MUSE_NPSC_PARENT
+    ITEM_KIDNAME,
+#endif
+#if CONFIG_MUSE_NPSC_ELF
+    ITEM_BEDTIME,
+#endif
     ITEM_VOLUME,
     ITEM_SPEAKER,
     ITEM_BRIGHTNESS,
@@ -79,6 +86,12 @@ typedef enum {
 } item_t;
 
 static const char *const ITEM_NAMES[ITEM_COUNT] = {
+#if CONFIG_MUSE_NPSC_PARENT
+    [ITEM_KIDNAME] = "Kid's name",
+#endif
+#if CONFIG_MUSE_NPSC_ELF
+    [ITEM_BEDTIME] = "Bedtime",
+#endif
     [ITEM_VOLUME] = "Volume",
     [ITEM_SPEAKER] = "Speaker",
     [ITEM_BRIGHTNESS] = "Brightness",
@@ -96,6 +109,12 @@ static const char *const ITEM_NAMES[ITEM_COUNT] = {
 
 /* What the talk button does on each row. */
 static const char *const ITEM_ACTIONS[ITEM_COUNT] = {
+#if CONFIG_MUSE_NPSC_PARENT
+    [ITEM_KIDNAME] = "Edit",
+#endif
+#if CONFIG_MUSE_NPSC_ELF
+    [ITEM_BEDTIME] = "Change",
+#endif
     [ITEM_VOLUME] = "Change",
     [ITEM_SPEAKER] = "Toggle",
     [ITEM_BRIGHTNESS] = "Change",
@@ -126,6 +145,9 @@ typedef enum {
     VIEW_BATTERY,
     VIEW_POWER,
     VIEW_RESET,
+#if CONFIG_MUSE_NPSC_PARENT
+    VIEW_NAME,      /* the kid's name letter picker */
+#endif
 } view_t;
 
 static QueueHandle_t s_keys;
@@ -193,6 +215,28 @@ static const char *sleep_name(int secs)
     return "Custom";
 }
 
+#if CONFIG_MUSE_NPSC_PARENT
+/* Letter picker: Down (MENU) steps through A-Z then Space, Delete and Done;
+ * Select (COMMUNICATE) picks. */
+static const char *const PICK_EXTRA[] = { "Space", "Delete", "Done" };
+#define PICK_N (26 + 3)
+static char s_pick_name[NPSC_NAME_MAX + 1];
+static int s_pick;
+
+static const char *pick_text(int i, char letter[2])
+{
+    if (i < 26) {
+        letter[0] = (char)('A' + i);
+        letter[1] = '\0';
+        return letter;
+    }
+    return PICK_EXTRA[i - 26];
+}
+
+static void pick_refresh(void);
+static void pick_key(muse_menu_key_t key);
+#endif
+
 static void value_text(int item, char *buf, size_t n)
 {
     static const char *const WIFI_VALUES[] = { "Off", "Not set", "Joining", "On", "Failed", "Not found" };
@@ -200,6 +244,19 @@ static void value_text(int item, char *buf, size_t n)
     muse_power_t p;
 
     switch (item) {
+#if CONFIG_MUSE_NPSC_PARENT
+    case ITEM_KIDNAME:
+        muse_npsc_name(buf, n);
+        if (!buf[0]) {
+            strlcpy(buf, "Not set", n);
+        }
+        break;
+#endif
+#if CONFIG_MUSE_NPSC_ELF
+    case ITEM_BEDTIME:
+        muse_npsc_bedtime_text(buf, n);
+        break;
+#endif
     case ITEM_VOLUME:
         snprintf(buf, n, "%d%%", muse_settings_volume());
         break;
@@ -324,6 +381,10 @@ static void refresh(void)
     } else if (s_view == VIEW_STATUS) {
         status_text(buf, sizeof(buf));
         set_text(s_page, buf);
+#if CONFIG_MUSE_NPSC_PARENT
+    } else if (s_view == VIEW_NAME) {
+        pick_refresh();
+#endif
     } else if (s_view == VIEW_BATTERY) {
         int64_t now = esp_timer_get_time();
         if (!s_batt_shown_us || now - s_batt_shown_us >= 1000000) {
@@ -361,6 +422,13 @@ static void show(view_t view)
         select_hint("Power off");
         break;
     }
+#if CONFIG_MUSE_NPSC_PARENT
+    case VIEW_NAME:
+        set_text(s_title, "KID'S NAME");
+        set_text(s_hint_down, muse_board->keyboard ? "Esc Back" : "Next");
+        select_hint("Pick");
+        break;
+#endif
     case VIEW_RESET:
         set_text(s_title, "RESET PAIRING");
         set_text(s_page, "Forget Wi-Fi and the Muse app pairing, then restart?");
@@ -389,6 +457,18 @@ static void activate(int item, int direction)
 {
     ESP_LOGI(TAG, "select %s", ITEM_NAMES[item]);
     switch (item) {
+#if CONFIG_MUSE_NPSC_PARENT
+    case ITEM_KIDNAME:
+        muse_npsc_name(s_pick_name, sizeof(s_pick_name));
+        s_pick = 0;
+        show(VIEW_NAME);
+        return;
+#endif
+#if CONFIG_MUSE_NPSC_ELF
+    case ITEM_BEDTIME:
+        muse_npsc_bedtime_step(direction);
+        break;
+#endif
     case ITEM_VOLUME:
         muse_settings_set_volume(value_step(VOLUME_STEPS, COUNT(VOLUME_STEPS), muse_settings_volume(), direction));
         muse_voice_request_chirp();
@@ -461,6 +541,11 @@ static void handle(muse_menu_key_t key)
         if (key == MUSE_MENU_BACK || key == MUSE_MENU_LEFT ||
             key == MUSE_MENU_SELECT || key == MUSE_MENU_DOWN) show(VIEW_LIST);
         break;
+#if CONFIG_MUSE_NPSC_PARENT
+    case VIEW_NAME:
+        pick_key(key);
+        break;
+#endif
     case VIEW_POWER:
     case VIEW_RESET:
         if (key == MUSE_MENU_BACK || key == MUSE_MENU_LEFT ||
@@ -478,6 +563,44 @@ static void handle(muse_menu_key_t key)
         break;
     }
 }
+
+#if CONFIG_MUSE_NPSC_PARENT
+static void pick_refresh(void)
+{
+    char letter[2], buf[96];
+    snprintf(buf, sizeof(buf), "%s_\n\n>  %s  <\n\nMENU: next\nTALK: pick", s_pick_name,
+             pick_text(s_pick, letter));
+    set_text(s_page, buf);
+}
+
+static void pick_key(muse_menu_key_t key)
+{
+    size_t len = strlen(s_pick_name);
+    if (key == MUSE_MENU_BACK) {
+        show(VIEW_LIST);
+        return;
+    }
+    if (key == MUSE_MENU_DOWN || key == MUSE_MENU_RIGHT) {
+        s_pick = (s_pick + 1) % PICK_N;
+    } else if (key == MUSE_MENU_UP || key == MUSE_MENU_LEFT) {
+        s_pick = (s_pick + PICK_N - 1) % PICK_N;
+    } else if (key == MUSE_MENU_SELECT) {
+        if (s_pick < 26 && len < NPSC_NAME_MAX) {
+            s_pick_name[len] = (char)(len == 0 || s_pick_name[len - 1] == ' ' ? 'A' + s_pick : 'a' + s_pick);
+            s_pick_name[len + 1] = '\0';
+        } else if (s_pick == 26 && len && len < NPSC_NAME_MAX && s_pick_name[len - 1] != ' ') {
+            strlcat(s_pick_name, " ", sizeof(s_pick_name));
+        } else if (s_pick == 27 && len) {
+            s_pick_name[len - 1] = '\0';
+        } else if (s_pick == 28) {
+            muse_npsc_set_name(s_pick_name);
+            show(VIEW_LIST);
+            return;
+        }
+    }
+    pick_refresh();
+}
+#endif
 
 void muse_menu_key(muse_menu_key_t key)
 {

@@ -50,6 +50,26 @@ menu "ESP32 Device SDK"
             Password for CONFIG_HOMEHUB_WIFI_SSID. Ignored when the SSID
             override is empty.
 
+    config MUSE_DEFAULT_WIFI_SSID
+        string "Wi-Fi network saved when none is"
+        default ""
+        help
+            If non-empty, and no Wi-Fi network is saved in NVS at boot (a
+            new or erased device), this one is saved as if picked in phone
+            setup, then joined as usual. A network saved later (phone setup,
+            the Muse app) takes its place; forgetting every network brings
+            this one back at the next boot. Unlike HOMEHUB_WIFI_SSID it
+            isn't forced. Keep the value out of git: tools/muse/secrets.py
+            fills it in from secrets/wifi_ssid or MUSE_WIFI_SSID.
+
+    config MUSE_DEFAULT_WIFI_PASSWORD
+        string "Its password"
+        default ""
+        help
+            Password for MUSE_DEFAULT_WIFI_SSID (empty for an open network).
+            Filled in by tools/muse/secrets.py from secrets/wifi_password or
+            MUSE_WIFI_PASSWORD; never commit it.
+
     config HOMEHUB_TOKEN_REFRESH_INTERVAL_DAYS
         int "Proactive device token refresh interval (days, 0 = disabled)"
         range 0 365

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Turn npsc_art.png (the 128x128 NORTH POLE SANTA COMMUNICATOR
-screen, drawn by design/make_screen.py) into npsc_art.h: RGB565 pixels (R in the high bits, the same packing
+"""Turn npsc_art.png (Gav's approved 128x128 NORTH POLE SANTA COMMUNICATOR
+screen) into npsc_art.h: RGB565 pixels (R in the high bits, the same packing
 as the default avatar's to565(); LVGL and the panel driver handle byte order),
-plus the two corner snowflakes' pixels for the state cue."""
+plus the two corner snowflakes' pixels for the state cue, and from
+npsc_art_rec.png the label patch shown while recording."""
 import sys
 from PIL import Image
 
@@ -36,5 +37,27 @@ out += ["};", "", "/* Snowflake pixels: x, y, which flake (0 left, 1 right). */"
 for i in range(0, len(flakes), 8):
     out.append("    " + " ".join("{%d, %d, %d}," % f for f in flakes[i:i + 8]))
 out += ["};", ""]
+
+# While recording: COMMUNICATE in its green box (npsc_art_rec.png), stored as
+# the rectangle that differs, widened to whole 2x2 cells.
+rec = Image.open("npsc_art_rec.png").convert("RGB")
+assert rec.size == (128, 128), rec.size
+rpx = rec.load()
+diff = [(x, y) for y in range(128) for x in range(128) if rpx[x, y] != px[x, y]]
+assert diff, "npsc_art_rec.png is the same as npsc_art.png"
+rx0 = min(x for x, _ in diff) & ~1
+ry0 = min(y for _, y in diff) & ~1
+rx1 = max(x for x, _ in diff) | 1
+ry1 = max(y for _, y in diff) | 1
+out += ["/* While recording: pixels [x0, x1] x [y0, y1] come from here. */",
+        "#define NPSC_REC_X0 %d" % rx0, "#define NPSC_REC_Y0 %d" % ry0,
+        "#define NPSC_REC_X1 %d" % rx1, "#define NPSC_REC_Y1 %d" % ry1,
+        "#define NPSC_REC_W (NPSC_REC_X1 - NPSC_REC_X0 + 1)",
+        "static const uint16_t NPSC_REC[(NPSC_REC_Y1 - NPSC_REC_Y0 + 1) * NPSC_REC_W] = {"]
+rvals = [rgb565(*rpx[x, y]) for y in range(ry0, ry1 + 1) for x in range(rx0, rx1 + 1)]
+for i in range(0, len(rvals), 16):
+    out.append("    " + ", ".join("0x%04x" % v for v in rvals[i:i + 16]) + ",")
+out += ["};", ""]
 open("npsc_art.h", "w").write("\n".join(out))
+print("recording patch: x %d..%d, y %d..%d" % (rx0, rx1, ry0, ry1))
 print("wrote npsc_art.h:", len(vals), "pixels,", len(flakes), "flake pixels")
